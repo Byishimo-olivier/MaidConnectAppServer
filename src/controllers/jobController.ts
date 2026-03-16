@@ -191,3 +191,32 @@ export const getEmployerApplications = async (req: AuthRequest, res: Response) =
         res.status(500).json({ message: 'Failed to fetch applications' });
     }
 };
+
+export const getMaidApplications = async (req: AuthRequest, res: Response) => {
+    try {
+        const userId = req.user?.userId;
+        if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+        const applications = await prisma.application.findMany({
+            where: { maidId: userId },
+            include: {
+                job: {
+                    include: {
+                        employer: {
+                            select: {
+                                fullName: true
+                            }
+                        }
+                    }
+                }
+            },
+            orderBy: { createdAt: 'desc' }
+        });
+
+        res.json(applications);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Failed to fetch your applications' });
+    }
+};
+
