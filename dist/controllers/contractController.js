@@ -14,6 +14,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.updateContractStatus = exports.getMyContracts = exports.createContract = void 0;
 const prisma_1 = __importDefault(require("../utils/prisma"));
+const notificationController_1 = require("./notificationController");
 const createContract = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     var _a;
     try {
@@ -34,6 +35,8 @@ const createContract = (req, res) => __awaiter(void 0, void 0, void 0, function*
                 status: 'DRAFT'
             }
         });
+        // Notify maid
+        yield (0, notificationController_1.createNotification)(maidId, 'New Contract Offer', `You have received a new contract offer: ${title}`, 'CONTRACT');
         res.status(201).json(contract);
     }
     catch (error) {
@@ -77,8 +80,19 @@ const updateContractStatus = (req, res) => __awaiter(void 0, void 0, void 0, fun
         // Verify ownership/permission logic could be added here
         const contract = yield prisma_1.default.contract.update({
             where: { id: Number(id) },
-            data: { status }
+            data: { status },
+            include: {
+                employer: { select: { fullName: true } },
+                maid: { select: { fullName: true } }
+            }
         });
+        // Notify relevant party
+        if (status === 'SIGNED' || status === 'ACTIVE') {
+            yield (0, notificationController_1.createNotification)(contract.employerId, 'Contract Update', `${contract.maid.fullName} has ${status.toLowerCase()} the contract: ${contract.title}`, 'CONTRACT');
+        }
+        else {
+            yield (0, notificationController_1.createNotification)(contract.maidId, 'Contract Update', `Your contract "${contract.title}" status is now ${status}.`, 'CONTRACT');
+        }
         res.json(contract);
     }
     catch (error) {

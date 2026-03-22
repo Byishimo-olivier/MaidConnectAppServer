@@ -12,11 +12,12 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.resetPassword = exports.forgotPassword = exports.login = exports.register = void 0;
+exports.resetPassword = exports.verifyResetPin = exports.forgotPassword = exports.login = exports.register = void 0;
 const bcryptjs_1 = __importDefault(require("bcryptjs"));
 const jsonwebtoken_1 = __importDefault(require("jsonwebtoken"));
 const prisma_1 = __importDefault(require("../utils/prisma"));
 const client_1 = require("@prisma/client");
+const emailService_1 = require("../utils/emailService");
 const register = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         const { email, password, role, fullName, phone, address, description } = req.body;
@@ -71,25 +72,21 @@ const forgotPassword = (req, res) => __awaiter(void 0, void 0, void 0, function*
         const user = yield prisma_1.default.user.findUnique({ where: { email } });
         if (!user) {
             // Safety: don't reveal if user exists or not
-            return res.json({ message: 'If an account exists for this email, you will receive reset instructions.' });
+            return res.json({ message: 'If an account exists for this email, you will receive a reset PIN.' });
         }
-        // Generate a 6-digit pin or a long token. Use 6-digit pin for easier mobile entry.
-        const token = Math.floor(100000 + Math.random() * 900000).toString();
+        // Generate a 6-digit PIN
+        const pin = Math.floor(100000 + Math.random() * 900000).toString();
         const expiry = new Date(Date.now() + 3600000); // 1 hour expiry
         yield prisma_1.default.user.update({
             where: { id: user.id },
             data: {
-                resetToken: token,
+                resetToken: pin,
                 resetTokenExpiry: expiry
             }
         });
-        // Mock email sending
-        console.log(`----------------------------------------`);
-        console.log(`PASSWORD RESET EMAIL SENT`);
-        console.log(`To: ${email}`);
-        console.log(`Token: ${token}`);
-        console.log(`----------------------------------------`);
-        res.json({ message: 'If an account exists for this email, you will receive reset instructions.' });
+        // Send real email with PIN — if this fails, the outer catch returns a 500
+        yield (0, emailService_1.sendResetPin)(email, pin);
+        res.json({ message: 'If an account exists for this email, you will receive a reset PIN.' });
     }
     catch (error) {
         console.error(error);
@@ -97,6 +94,21 @@ const forgotPassword = (req, res) => __awaiter(void 0, void 0, void 0, function*
     }
 });
 exports.forgotPassword = forgotPassword;
+const verifyResetPin = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const { email, pin } = req.body;
+        const user = yield prisma_1.default.user.findUnique({ where: { email } });
+        if (!user || user.resetToken !== pin || !user.resetTokenExpiry || user.resetTokenExpiry < new Date()) {
+            return res.status(400).json({ message: 'Invalid or expired PIN' });
+        }
+        res.json({ message: 'PIN verified successfully' });
+    }
+    catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Verification failed' });
+    }
+});
+exports.verifyResetPin = verifyResetPin;
 const resetPassword = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         const { email, token, newPassword } = req.body;

@@ -16,15 +16,16 @@ dotenv.config();
 
 const app: Express = express();
 const port = process.env.PORT || 8000;
+const clientOrigin = process.env.CLIENT_ORIGIN || '*';
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
     cors: {
-        origin: "*", // Allow all for development
+        origin: clientOrigin,
         methods: ["GET", "POST"]
     }
 });
 
-app.use(cors());
+app.use(cors({ origin: clientOrigin }));
 app.use(express.json());
 
 app.use('/api/auth', authRoutes);
@@ -105,5 +106,5 @@ io.on('connection', (socket) => {
 });
 
 httpServer.listen(port, () => {
-    console.log(`[server]: Server is running at http://localhost:${port}`);
+    console.log(`[server]: Server is running on port ${port}`);
 });

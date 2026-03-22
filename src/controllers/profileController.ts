@@ -264,35 +264,8 @@ export const getMaidProfileById = async (req: AuthRequest, res: Response) => {
 
         if (!maid) return res.status(404).json({ message: 'Maid not found' });
 
-        let isUnlocked = false;
-
-        // If requester is an employer, check if they unlocked this profile
-        if (currentUserId && currentUserRole === 'EMPLOYER') {
-            const unlock = await prisma.unlockedProfile.findUnique({
-                where: {
-                    employerId_maidId: {
-                        employerId: currentUserId,
-                        maidId: parseInt(id)
-                    }
-                }
-            });
-            if (unlock) isUnlocked = true;
-        }
-
-        // Mask sensitive info if not unlocked
-        const maskContact = (text: string | null) => {
-            if (!text) return '';
-            if (text.includes('@')) {
-                const [user, domain] = text.split('@');
-                return `${user.slice(0, 2)}****@${domain}`;
-            }
-            return text.slice(0, 4) + ' **** ' + text.slice(-3);
-        };
-
-        if (!isUnlocked) {
-            maid.email = maskContact(maid.email);
-            maid.phone = maskContact(maid.phone);
-        }
+        // Contact details are now available without a payment unlock step.
+        const isUnlocked = currentUserRole === 'EMPLOYER' || currentUserId === maid.id;
 
         res.json({ ...maid, isUnlocked });
     } catch (error) {

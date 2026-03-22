@@ -6,6 +6,7 @@ const auth_1 = require("../middleware/auth");
 const router = (0, express_1.Router)();
 router.get('/me', auth_1.authenticateToken, profileController_1.getMyProfile);
 router.put('/me', auth_1.authenticateToken, profileController_1.updateProfile);
+router.get('/activity', auth_1.authenticateToken, profileController_1.getActivityFeed);
 router.get('/maids', profileController_1.getMaidProfiles);
-router.get('/maid/:id', profileController_1.getMaidProfileById);
+router.get('/maid/:id', auth_1.authenticateToken, profileController_1.getMaidProfileById);
 exports.default = router;
