@@ -192,6 +192,46 @@ export const getEmployerApplications = async (req: AuthRequest, res: Response) =
     }
 };
 
+export const getApplicationById = async (req: AuthRequest, res: Response) => {
+    try {
+        const { id } = req.params;
+        const userId = req.user?.userId;
+        if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+        const application = await prisma.application.findFirst({
+            where: { id: Number(id) },
+            include: {
+                maid: {
+                    select: {
+                        id: true,
+                        fullName: true,
+                        profileImage: true,
+                    }
+                },
+                job: {
+                    select: {
+                        id: true,
+                        title: true,
+                        employerId: true
+                    }
+                }
+            }
+        });
+
+        if (!application) return res.status(404).json({ message: 'Application not found' });
+
+        // Check if user is the employer of this job
+        if (application.job.employerId !== userId) {
+            return res.status(403).json({ message: 'Unauthorized to view this application' });
+        }
+
+        res.json(application);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Failed to fetch application' });
+    }
+};
+
 export const getMaidApplications = async (req: AuthRequest, res: Response) => {
     try {
         const userId = req.user?.userId;

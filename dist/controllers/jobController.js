@@ -12,7 +12,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.getMaidApplications = exports.getEmployerApplications = exports.updateApplicationStatus = exports.applyForJob = exports.getMyJobs = exports.getJobs = exports.createJob = void 0;
+exports.getMaidApplications = exports.getApplicationById = exports.getEmployerApplications = exports.updateApplicationStatus = exports.applyForJob = exports.getMyJobs = exports.getJobs = exports.createJob = void 0;
 const prisma_1 = __importDefault(require("../utils/prisma"));
 const notificationController_1 = require("./notificationController");
 const createJob = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
@@ -185,6 +185,46 @@ const getEmployerApplications = (req, res) => __awaiter(void 0, void 0, void 0, 
     }
 });
 exports.getEmployerApplications = getEmployerApplications;
+const getApplicationById = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
+    try {
+        const { id } = req.params;
+        const userId = (_a = req.user) === null || _a === void 0 ? void 0 : _a.userId;
+        if (!userId)
+            return res.status(401).json({ message: 'Unauthorized' });
+        const application = yield prisma_1.default.application.findFirst({
+            where: { id: Number(id) },
+            include: {
+                maid: {
+                    select: {
+                        id: true,
+                        fullName: true,
+                        profileImage: true,
+                    }
+                },
+                job: {
+                    select: {
+                        id: true,
+                        title: true,
+                        employerId: true
+                    }
+                }
+            }
+        });
+        if (!application)
+            return res.status(404).json({ message: 'Application not found' });
+        // Check if user is the employer of this job
+        if (application.job.employerId !== userId) {
+            return res.status(403).json({ message: 'Unauthorized to view this application' });
+        }
+        res.json(application);
+    }
+    catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Failed to fetch application' });
+    }
+});
+exports.getApplicationById = getApplicationById;
 const getMaidApplications = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     var _a;
     try {

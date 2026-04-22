@@ -259,15 +259,62 @@ export const getMaidProfileById = async (req: AuthRequest, res: Response) => {
                 preferredHours: true,
                 expectedSalary: true,
                 salaryNegotiable: true,
+                nidPhoto: true,
+                insurancePhoto: true,
             }
         });
 
         if (!maid) return res.status(404).json({ message: 'Maid not found' });
 
-        // Contact details are now available without a payment unlock step.
-        const isUnlocked = currentUserRole === 'EMPLOYER' || currentUserId === maid.id;
+        let isUnlocked = false;
+        let hasApplication = false;
 
-        res.json({ ...maid, isUnlocked });
+        // If requester is an employer, check if they unlocked this profile or have applications
+        if (currentUserId && currentUserRole === 'EMPLOYER') {
+            const unlock = await prisma.unlockedProfile.findUnique({
+                where: {
+                    employerId_maidId: {
+                        employerId: currentUserId,
+                        maidId: parseInt(id)
+                    }
+                }
+            });
+            if (unlock) isUnlocked = true;
+
+            // Check if employer has any applications from this maid
+            const application = await prisma.application.findFirst({
+                where: {
+                    maidId: parseInt(id),
+                    job: {
+                        employerId: currentUserId
+                    }
+                }
+            });
+            if (application) hasApplication = true;
+        }
+
+        // Mask sensitive info if not unlocked
+        const maskContact = (text: string | null) => {
+            if (!text) return '';
+            if (text.includes('@')) {
+                const [user, domain] = text.split('@');
+                return `${user.slice(0, 2)}****@${domain}`;
+            }
+            return text.slice(0, 4) + ' **** ' + text.slice(-3);
+        };
+
+        if (!isUnlocked) {
+            maid.email = maskContact(maid.email);
+            maid.phone = maskContact(maid.phone);
+        }
+
+        // Mask documents if not unlocked and no application
+        if (!isUnlocked && !hasApplication) {
+            maid.nidPhoto = null;
+            maid.insurancePhoto = null;
+        }
+
+        res.json({ ...maid, isUnlocked, hasApplication });
     } catch (error) {
         console.error(error);
         res.status(500).json({ message: 'Failed to fetch maid profile' });

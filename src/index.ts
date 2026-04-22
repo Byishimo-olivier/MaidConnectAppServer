@@ -1,5 +1,5 @@
+import 'dotenv/config';
 import express, { Express, Request, Response } from 'express';
-import dotenv from 'dotenv';
 import cors from 'cors';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
@@ -11,8 +11,7 @@ import notificationRoutes from './routes/notificationRoutes';
 import paymentRoutes from './routes/paymentRoutes';
 import chatRoutes from './routes/chatRoutes';
 import miscRoutes from './routes/miscRoutes';
-
-dotenv.config();
+import adminRoutes from './routes/adminRoutes';
 
 const app: Express = express();
 const port = process.env.PORT || 8000;
@@ -26,7 +25,11 @@ const io = new Server(httpServer, {
 });
 
 app.use(cors({ origin: clientOrigin }));
-app.use(express.json());
+app.use(express.json({
+    verify: (req: Request, _res, buf) => {
+        (req as any).rawBody = Buffer.from(buf);
+    }
+}));
 
 app.use('/api/auth', authRoutes);
 app.use('/api/jobs', jobRoutes);
@@ -35,6 +38,7 @@ app.use('/api/contracts', contractRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/payments', paymentRoutes);
 app.use('/api/chat', chatRoutes);
+app.use('/api/admin', adminRoutes);
 app.use('/api', miscRoutes);
 
 app.get('/', (req: Request, res: Response) => {

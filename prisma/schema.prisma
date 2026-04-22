@@ -34,6 +34,7 @@ enum ContractStatus {
 
 enum ApplicationStatus {
   PENDING
+  INTERVIEW
   ACCEPTED
   REJECTED
   WITHDRAWN
