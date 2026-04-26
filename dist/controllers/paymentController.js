@@ -12,7 +12,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.checkUnlockStatus = exports.getRefundStatus = exports.getPayoutStatus = exports.resendDepositCallback = exports.getDepositStatus = exports.verifyProfileUnlock = exports.handlePawaPayWebhook = exports.initiateRefund = exports.initiatePayout = exports.initiateDeposit = void 0;
+exports.checkUnlockStatus = exports.getRefundStatus = exports.getPayoutStatus = exports.resendDepositCallback = exports.getDepositStatus = exports.verifyProfileUnlock = exports.handlePawaPayWebhook = exports.initiateRefund = exports.initiatePayout = exports.initiateDeposit = exports.getGatewayBalance = void 0;
 const crypto_1 = __importDefault(require("crypto"));
 const axios_1 = __importDefault(require("axios"));
 const prisma_1 = __importDefault(require("../utils/prisma"));
@@ -37,11 +37,19 @@ const PAYPACK_WEBHOOK_MODE = String(process.env.PAYPACK_WEBHOOK_MODE || (APP_URL
 const PAWAPAY_API_KEY = process.env.PAWAPAY_API_KEY;
 const PAWAPAY_BASE_URL = String(process.env.PAWAPAY_BASE_URL || 'https://api.sandbox.pawapay.io').replace(/\/+$/, '');
 const PAWAPAY_WEBHOOK_SECRET_HASH = process.env.PAWAPAY_SECRET_HASH || process.env.PAWAPAY_WEBHOOK_SECRET_HASH || '';
+const INTOUCHPAY_USERNAME = String(process.env.INTOUCHPAY_USERNAME || '').trim();
+const INTOUCHPAY_ACCOUNT_NO = String(process.env.INTOUCHPAY_ACCOUNT_NO || '').trim();
+const INTOUCHPAY_PARTNER_PASSWORD = String(process.env.INTOUCHPAY_PARTNER_PASSWORD || '').trim();
+const INTOUCHPAY_BASE_URL = String(process.env.INTOUCHPAY_BASE_URL || 'https://www.intouchpay.co.rw/api').replace(/\/+$/, '');
+const INTOUCHPAY_DEFAULT_WITHDRAW_CHARGE = String(process.env.INTOUCHPAY_WITHDRAW_CHARGE || '1').trim();
+const INTOUCHPAY_DEFAULT_SID = String(process.env.INTOUCHPAY_SID || '1').trim();
 const DEPOSIT_CALLBACK_URL = process.env.PAYPACK_DEPOSIT_CALLBACK_URL
     || process.env.PAWAPAY_DEPOSIT_CALLBACK_URL
+    || process.env.INTOUCHPAY_CALLBACK_URL
     || `${APP_URL}/api/payments/webhook/deposit`;
 const PAYOUT_CALLBACK_URL = process.env.PAYPACK_PAYOUT_CALLBACK_URL
     || process.env.PAWAPAY_PAYOUT_CALLBACK_URL
+    || process.env.INTOUCHPAY_CALLBACK_URL
     || `${APP_URL}/api/payments/webhook/payout`;
 const REFUND_CALLBACK_URL = process.env.PAYPACK_REFUND_CALLBACK_URL
     || process.env.PAWAPAY_REFUND_CALLBACK_URL
@@ -49,12 +57,36 @@ const REFUND_CALLBACK_URL = process.env.PAYPACK_REFUND_CALLBACK_URL
 const DEFAULT_PROVIDER = process.env.PAYPACK_DEFAULT_PROVIDER || process.env.PAWAPAY_DEFAULT_PROVIDER || '';
 const DEFAULT_DEPOSIT_PROVIDER = process.env.PAYPACK_DEFAULT_DEPOSIT_PROVIDER || process.env.PAWAPAY_DEFAULT_DEPOSIT_PROVIDER || DEFAULT_PROVIDER;
 const DEFAULT_PAYOUT_PROVIDER = process.env.PAYPACK_DEFAULT_PAYOUT_PROVIDER || process.env.PAWAPAY_DEFAULT_PAYOUT_PROVIDER || DEFAULT_PROVIDER;
-const gatewayMode = PAYPACK_APPLICATION_ID && PAYPACK_APPLICATION_SECRET
-    ? 'paypack'
-    : PAWAPAY_API_KEY
-        ? 'pawapay'
-        : 'none';
-console.log(`[payments] gateway=${gatewayMode} base=${gatewayMode === 'paypack' ? PAYPACK_BASE_URL : PAWAPAY_BASE_URL}`);
+const requestedGatewayMode = String(process.env.PAYMENT_GATEWAY_MODE || '').trim().toLowerCase();
+const hasPaypackCredentials = Boolean(PAYPACK_APPLICATION_ID && PAYPACK_APPLICATION_SECRET);
+const hasPawaPayCredentials = Boolean(PAWAPAY_API_KEY);
+const hasIntouchPayCredentials = Boolean(INTOUCHPAY_USERNAME && INTOUCHPAY_ACCOUNT_NO && INTOUCHPAY_PARTNER_PASSWORD);
+const resolveGatewayMode = () => {
+    if (requestedGatewayMode === 'paypack')
+        return hasPaypackCredentials ? 'paypack' : 'none';
+    if (requestedGatewayMode === 'pawapay')
+        return hasPawaPayCredentials ? 'pawapay' : 'none';
+    if (requestedGatewayMode === 'intouchpay')
+        return hasIntouchPayCredentials ? 'intouchpay' : 'none';
+    if (requestedGatewayMode === 'none')
+        return 'none';
+    if (hasPaypackCredentials)
+        return 'paypack';
+    if (hasPawaPayCredentials)
+        return 'pawapay';
+    if (hasIntouchPayCredentials)
+        return 'intouchpay';
+    return 'none';
+};
+const gatewayMode = resolveGatewayMode();
+const gatewayBaseUrl = gatewayMode === 'paypack'
+    ? PAYPACK_BASE_URL
+    : gatewayMode === 'pawapay'
+        ? PAWAPAY_BASE_URL
+        : gatewayMode === 'intouchpay'
+            ? INTOUCHPAY_BASE_URL
+            : 'n/a';
+console.log(`[payments] gateway=${gatewayMode} base=${gatewayBaseUrl}`);
 const hasGatewayAuth = () => gatewayMode !== 'none';
 const isSandboxEnvironment = () => gatewayMode === 'pawapay' && /sandbox/i.test(PAWAPAY_BASE_URL);
 const createTxRef = (prefix, userId) => `${prefix}_${userId}_${Date.now()}`;
@@ -76,6 +108,60 @@ const toPaymentStatus = (status) => {
     if (PENDING_STATUSES.has(normalized))
         return 'PENDING';
     return normalized;
+};
+const INTOUCHPAY_SUCCESS_CODES = new Set(['01', '2001']);
+const INTOUCHPAY_PENDING_CODES = new Set(['1000']);
+const INTOUCHPAY_REFERENCE_SEPARATOR = '|';
+const createIntouchTimestamp = () => {
+    const iso = new Date().toISOString().replace(/\D/g, '');
+    return iso.slice(0, 14);
+};
+const createIntouchPassword = (timestamp) => {
+    const secret = `${INTOUCHPAY_USERNAME}${INTOUCHPAY_ACCOUNT_NO}${INTOUCHPAY_PARTNER_PASSWORD}${timestamp}`;
+    return crypto_1.default.createHash('sha256').update(secret).digest('hex');
+};
+const normalizeIntouchResponseCode = (code) => String(code !== null && code !== void 0 ? code : '').trim().toUpperCase();
+const intouchStatusFromResponse = (status, responseCode) => {
+    const normalizedStatus = normalizeStatus(status);
+    if (normalizedStatus) {
+        if (SUCCESS_STATUSES.has(normalizedStatus))
+            return normalizedStatus;
+        if (PENDING_STATUSES.has(normalizedStatus))
+            return normalizedStatus;
+    }
+    const code = normalizeIntouchResponseCode(responseCode);
+    if (INTOUCHPAY_SUCCESS_CODES.has(code))
+        return 'SUCCESSFUL';
+    if (INTOUCHPAY_PENDING_CODES.has(code))
+        return 'PENDING';
+    if (code)
+        return 'FAILED';
+    return normalizedStatus || 'PENDING';
+};
+const combineIntouchReference = (requestTransactionId, providerTransactionId) => {
+    const requestId = String(requestTransactionId || '').trim();
+    const providerId = String(providerTransactionId || '').trim();
+    if (!requestId)
+        return providerId;
+    if (!providerId)
+        return requestId;
+    return `${requestId}${INTOUCHPAY_REFERENCE_SEPARATOR}${providerId}`;
+};
+const splitIntouchReference = (reference) => {
+    const normalized = String(reference || '').trim();
+    if (!normalized.includes(INTOUCHPAY_REFERENCE_SEPARATOR)) {
+        return {
+            requestTransactionId: normalized,
+            providerTransactionId: normalized
+        };
+    }
+    const [requestTransactionId, providerTransactionId] = normalized
+        .split(INTOUCHPAY_REFERENCE_SEPARATOR)
+        .map((part) => part.trim());
+    return {
+        requestTransactionId: requestTransactionId || normalized,
+        providerTransactionId: providerTransactionId || requestTransactionId || normalized
+    };
 };
 const sanitizeAmount = (value) => {
     const parsed = Number(value);
@@ -101,7 +187,9 @@ const buildGatewayUrl = (path) => {
     const normalizedPath = path.startsWith('/') ? path : `/${path}`;
     if (gatewayMode === 'paypack')
         return `${PAYPACK_BASE_URL}${normalizedPath}`;
-    return `${PAWAPAY_BASE_URL}${normalizedPath}`;
+    if (gatewayMode === 'pawapay')
+        return `${PAWAPAY_BASE_URL}${normalizedPath}`;
+    return `${INTOUCHPAY_BASE_URL}${normalizedPath}`;
 };
 const getRawBodyBuffer = (req) => {
     const raw = req.rawBody;
@@ -257,11 +345,44 @@ const parsePaypackTransaction = (payload) => {
         raw: root
     };
 };
+const parseIntouchTransaction = (payload) => {
+    var _a, _b;
+    const root = (payload === null || payload === void 0 ? void 0 : payload.jsonpayload) || (payload === null || payload === void 0 ? void 0 : payload.data) || payload || {};
+    const responseCode = normalizeIntouchResponseCode(root.responsecode);
+    const reference = combineIntouchReference(root.requesttransactionid || root.requestTransactionId, root.transactionid || root.referenceid || root.referenceId);
+    const status = intouchStatusFromResponse(root.status, responseCode);
+    const amount = toNumber((_b = (_a = root.amount) !== null && _a !== void 0 ? _a : root.requestedamount) !== null && _b !== void 0 ? _b : 0);
+    const currency = normalizeCurrency(root.currency || 'RWF');
+    return {
+        reference,
+        amount,
+        currency,
+        status,
+        raw: root
+    };
+};
+const toFormBody = (payload) => {
+    const form = new URLSearchParams();
+    for (const [key, value] of Object.entries(payload)) {
+        if (value === undefined || value === null)
+            continue;
+        form.append(key, String(value));
+    }
+    return form.toString();
+};
 const extractErrorMessage = (error) => {
-    var _a, _b, _c, _d, _e, _f, _g;
-    const providerMessage = ((_c = (_b = (_a = error === null || error === void 0 ? void 0 : error.response) === null || _a === void 0 ? void 0 : _a.data) === null || _b === void 0 ? void 0 : _b.failureReason) === null || _c === void 0 ? void 0 : _c.failureMessage)
-        || ((_e = (_d = error === null || error === void 0 ? void 0 : error.response) === null || _d === void 0 ? void 0 : _d.data) === null || _e === void 0 ? void 0 : _e.message)
-        || ((_g = (_f = error === null || error === void 0 ? void 0 : error.response) === null || _f === void 0 ? void 0 : _f.data) === null || _g === void 0 ? void 0 : _g.error)
+    var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k;
+    const intouchPayload = ((_b = (_a = error === null || error === void 0 ? void 0 : error.response) === null || _a === void 0 ? void 0 : _a.data) === null || _b === void 0 ? void 0 : _b.jsonpayload) || ((_c = error === null || error === void 0 ? void 0 : error.response) === null || _c === void 0 ? void 0 : _c.data);
+    const intouchCode = intouchPayload === null || intouchPayload === void 0 ? void 0 : intouchPayload.responsecode;
+    const intouchStatusDesc = intouchPayload === null || intouchPayload === void 0 ? void 0 : intouchPayload.statusdesc;
+    if (intouchCode || intouchStatusDesc) {
+        return [intouchCode ? `code=${intouchCode}` : null, intouchStatusDesc || (intouchPayload === null || intouchPayload === void 0 ? void 0 : intouchPayload.message)]
+            .filter(Boolean)
+            .join(' ');
+    }
+    const providerMessage = ((_f = (_e = (_d = error === null || error === void 0 ? void 0 : error.response) === null || _d === void 0 ? void 0 : _d.data) === null || _e === void 0 ? void 0 : _e.failureReason) === null || _f === void 0 ? void 0 : _f.failureMessage)
+        || ((_h = (_g = error === null || error === void 0 ? void 0 : error.response) === null || _g === void 0 ? void 0 : _g.data) === null || _h === void 0 ? void 0 : _h.message)
+        || ((_k = (_j = error === null || error === void 0 ? void 0 : error.response) === null || _j === void 0 ? void 0 : _j.data) === null || _k === void 0 ? void 0 : _k.error)
         || (error === null || error === void 0 ? void 0 : error.message);
     if (typeof providerMessage === 'string')
         return providerMessage;
@@ -368,6 +489,30 @@ const initiateGatewayDeposit = (params) => __awaiter(void 0, void 0, void 0, fun
         }
         return Object.assign(Object.assign({}, parsed), { amount: parsed.amount || params.amount, currency: params.currency, exists: false });
     }
+    if (gatewayMode === 'intouchpay') {
+        const timestamp = createIntouchTimestamp();
+        const password = createIntouchPassword(timestamp);
+        const requestTransactionId = String(params.clientReferenceId || createProviderId());
+        const payload = {
+            username: INTOUCHPAY_USERNAME,
+            accountno: INTOUCHPAY_ACCOUNT_NO,
+            timestamp,
+            amount: params.amount,
+            password,
+            mobilephone: params.phoneNumber,
+            mobilephoneno: params.phoneNumber,
+            requesttransactionid: requestTransactionId,
+            callbackurl: DEPOSIT_CALLBACK_URL
+        };
+        const response = yield axios_1.default.post(buildGatewayUrl('/requestpayment/'), toFormBody(payload), {
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                Accept: 'application/json'
+            }
+        });
+        const parsed = parseIntouchTransaction(response === null || response === void 0 ? void 0 : response.data);
+        return Object.assign(Object.assign({}, parsed), { reference: parsed.reference || requestTransactionId, amount: parsed.amount || params.amount, currency: params.currency, exists: true });
+    }
     const payload = {
         depositId: String(params.clientReferenceId || createProviderId()),
         payer: {
@@ -416,6 +561,32 @@ const initiateGatewayPayout = (params) => __awaiter(void 0, void 0, void 0, func
         }
         return Object.assign(Object.assign({}, parsed), { amount: parsed.amount || params.amount, currency: params.currency });
     }
+    if (gatewayMode === 'intouchpay') {
+        const timestamp = createIntouchTimestamp();
+        const password = createIntouchPassword(timestamp);
+        const requestTransactionId = String(params.clientReferenceId || createProviderId());
+        const payload = {
+            username: INTOUCHPAY_USERNAME,
+            accountno: INTOUCHPAY_ACCOUNT_NO,
+            timestamp,
+            amount: params.amount,
+            withdrawcharge: INTOUCHPAY_DEFAULT_WITHDRAW_CHARGE,
+            reason: params.customerMessage || 'Maid payout',
+            sid: INTOUCHPAY_DEFAULT_SID,
+            password,
+            mobilephone: params.phoneNumber,
+            mobilephoneno: params.phoneNumber,
+            requesttransactionid: requestTransactionId
+        };
+        const response = yield axios_1.default.post(buildGatewayUrl('/requestdeposit/'), toFormBody(payload), {
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                Accept: 'application/json'
+            }
+        });
+        const parsed = parseIntouchTransaction(response === null || response === void 0 ? void 0 : response.data);
+        return Object.assign(Object.assign({}, parsed), { reference: parsed.reference || requestTransactionId, amount: parsed.amount || params.amount, currency: params.currency });
+    }
     const payload = {
         payoutId: String(params.clientReferenceId || createProviderId()),
         recipient: {
@@ -452,6 +623,27 @@ const fetchGatewayTransaction = (reference, kind) => __awaiter(void 0, void 0, v
         const parsed = parsePaypackTransaction(response === null || response === void 0 ? void 0 : response.data);
         return Object.assign(Object.assign({}, parsed), { reference: parsed.reference || reference });
     }
+    if (gatewayMode === 'intouchpay') {
+        const { requestTransactionId, providerTransactionId } = splitIntouchReference(reference);
+        const timestamp = createIntouchTimestamp();
+        const password = createIntouchPassword(timestamp);
+        const payload = {
+            username: INTOUCHPAY_USERNAME,
+            accountno: INTOUCHPAY_ACCOUNT_NO,
+            timestamp,
+            password,
+            requesttransactionid: requestTransactionId,
+            transactionid: providerTransactionId
+        };
+        const response = yield axios_1.default.post(buildGatewayUrl('/gettransactionstatus/'), toFormBody(payload), {
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                Accept: 'application/json'
+            }
+        });
+        const parsed = parseIntouchTransaction(response === null || response === void 0 ? void 0 : response.data);
+        return Object.assign(Object.assign({}, parsed), { reference: parsed.reference || combineIntouchReference(requestTransactionId, providerTransactionId) || reference });
+    }
     const path = kind === 'deposit'
         ? `/v2/deposits/${encodeURIComponent(reference)}`
         : kind === 'payout'
@@ -463,6 +655,53 @@ const fetchGatewayTransaction = (reference, kind) => __awaiter(void 0, void 0, v
     const parsed = parsePawaPayTransaction(response === null || response === void 0 ? void 0 : response.data);
     return Object.assign(Object.assign({}, parsed), { reference: parsed.reference || reference });
 });
+const getGatewayBalance = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a, _b;
+    try {
+        const userId = (_a = req.user) === null || _a === void 0 ? void 0 : _a.userId;
+        if (!userId)
+            return res.status(401).json({ message: 'Unauthorized' });
+        if (!hasGatewayAuth()) {
+            return res.status(500).json({ message: 'Payment gateway is not configured' });
+        }
+        if (gatewayMode !== 'intouchpay') {
+            return res.status(501).json({
+                message: `Balance inquiry is currently implemented for IntouchPay only. Active gateway: ${gatewayMode}`
+            });
+        }
+        const timestamp = createIntouchTimestamp();
+        const password = createIntouchPassword(timestamp);
+        const payload = {
+            username: INTOUCHPAY_USERNAME,
+            accountno: INTOUCHPAY_ACCOUNT_NO,
+            timestamp,
+            password
+        };
+        const response = yield axios_1.default.post(buildGatewayUrl('/getbalance/'), toFormBody(payload), {
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                Accept: 'application/json'
+            }
+        });
+        const data = (response === null || response === void 0 ? void 0 : response.data) || {};
+        const balance = toNumber(data.balance, 0);
+        const success = Boolean(data.success);
+        return res.json({
+            gateway: gatewayMode,
+            success,
+            balance,
+            raw: data
+        });
+    }
+    catch (error) {
+        console.error('Get gateway balance failed:', ((_b = error.response) === null || _b === void 0 ? void 0 : _b.data) || error.message || error);
+        return res.status(400).json({
+            message: 'Failed to query gateway balance',
+            debug: extractErrorMessage(error)
+        });
+    }
+});
+exports.getGatewayBalance = getGatewayBalance;
 const updatePaymentStatus = (txRef_1, status_1, ...args_1) => __awaiter(void 0, [txRef_1, status_1, ...args_1], void 0, function* (txRef, status, metadata = {}) {
     try {
         const existing = yield prisma_1.default.payment.findUnique({ where: { transactionId: txRef } });
@@ -545,7 +784,9 @@ const initiateDeposit = (req, res) => __awaiter(void 0, void 0, void 0, function
             ? PAYPACK_WEBHOOK_MODE === 'production'
             : gatewayMode === 'pawapay'
                 ? !isSandboxEnvironment()
-                : false;
+                : gatewayMode === 'intouchpay'
+                    ? true
+                    : false;
         return res.json({
             paymentId: payment.id,
             tx_ref: txRef,
@@ -654,9 +895,9 @@ const initiateRefund = (req, res) => __awaiter(void 0, void 0, void 0, function*
         if (!hasGatewayAuth()) {
             return res.status(500).json({ message: 'Payment gateway is not configured' });
         }
-        if (gatewayMode === 'paypack') {
+        if (gatewayMode === 'paypack' || gatewayMode === 'intouchpay') {
             return res.status(501).json({
-                message: 'PayPack refund endpoint is not available in this integration'
+                message: `${gatewayMode === 'paypack' ? 'PayPack' : 'IntouchPay'} refund endpoint is not available in this integration`
             });
         }
         const { transaction_id, depositId, amount, currency = 'RWF', clientReferenceId, metadata } = req.body;
@@ -717,16 +958,22 @@ const handlePawaPayWebhook = (req, res) => __awaiter(void 0, void 0, void 0, fun
             return res.status(401).json({ message: 'Invalid webhook signature' });
         }
         const event = req.body || {};
-        const data = event.data || event;
+        const data = event.jsonpayload || event.data || event;
+        const intouchRequestId = String(data.requesttransactionid || data.requestTransactionId || '').trim();
+        const intouchTransactionId = String(data.transactionid || data.referenceid || data.referenceId || '').trim();
         const txRef = String(data.ref
             || data.tx_ref
             || data.reference
             || data.depositId
             || data.payoutId
             || data.refundId
+            || combineIntouchReference(intouchRequestId, intouchTransactionId)
+            || intouchRequestId
             || data.id
             || '').trim();
-        const status = String(data.status || event.status || event.kind || event.event || 'UNKNOWN');
+        const status = gatewayMode === 'intouchpay'
+            ? intouchStatusFromResponse(data.status, data.responsecode)
+            : String(data.status || event.status || event.kind || event.event || 'UNKNOWN');
         const amount = toNumber((_c = (_a = data.amount) !== null && _a !== void 0 ? _a : (_b = data.currency) === null || _b === void 0 ? void 0 : _b.amount) !== null && _c !== void 0 ? _c : 0);
         const currency = String(data.currency || 'RWF');
         if (txRef) {
@@ -954,9 +1201,9 @@ const resendDepositCallback = (req, res) => __awaiter(void 0, void 0, void 0, fu
         const payment = yield ensurePaymentAccess(userId, depositId, res);
         if (payment === null)
             return;
-        if (gatewayMode === 'paypack') {
+        if (gatewayMode === 'paypack' || gatewayMode === 'intouchpay') {
             return res.status(501).json({
-                message: 'PayPack does not support resend callback by transaction id'
+                message: `${gatewayMode === 'paypack' ? 'PayPack' : 'IntouchPay'} does not support resend callback by transaction id`
             });
         }
         const response = yield axios_1.default.post(buildGatewayUrl(`/v2/deposits/resend-callback/${encodeURIComponent(depositId)}`), {}, {
@@ -1025,9 +1272,9 @@ const getRefundStatus = (req, res) => __awaiter(void 0, void 0, void 0, function
             return res.status(401).json({ message: 'Unauthorized' });
         if (!hasGatewayAuth())
             return res.status(500).json({ message: 'Payment gateway is not configured' });
-        if (gatewayMode === 'paypack') {
+        if (gatewayMode === 'paypack' || gatewayMode === 'intouchpay') {
             return res.status(501).json({
-                message: 'PayPack refund status endpoint is not available in this integration'
+                message: `${gatewayMode === 'paypack' ? 'PayPack' : 'IntouchPay'} refund status endpoint is not available in this integration`
             });
         }
         const refundId = String(req.params.refundId || '').trim();

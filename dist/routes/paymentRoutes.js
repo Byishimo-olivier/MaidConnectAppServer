@@ -6,6 +6,7 @@ const auth_1 = require("../middleware/auth");
 const router = (0, express_1.Router)();
 router.post('/deposit', auth_1.authenticateToken, paymentController_1.initiateDeposit);
 router.get('/deposit/:depositId', auth_1.authenticateToken, paymentController_1.getDepositStatus);
+router.get('/balance', auth_1.authenticateToken, paymentController_1.getGatewayBalance);
 router.post('/deposit/resend-callback/:depositId', auth_1.authenticateToken, paymentController_1.resendDepositCallback);
 router.post('/payout', auth_1.authenticateToken, paymentController_1.initiatePayout);
 router.get('/payout/:payoutId', auth_1.authenticateToken, paymentController_1.getPayoutStatus);
