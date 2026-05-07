@@ -12,7 +12,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.checkUnlockStatus = exports.getRefundStatus = exports.getPayoutStatus = exports.resendDepositCallback = exports.getDepositStatus = exports.verifyProfileUnlock = exports.handlePawaPayWebhook = exports.initiateRefund = exports.initiatePayout = exports.initiateDeposit = exports.getGatewayBalance = void 0;
+exports.checkUnlockStatus = exports.getRefundStatus = exports.getPayoutStatus = exports.resendDepositCallback = exports.getDepositStatus = exports.verifyJobPostingPayment = exports.verifyProfileUnlock = exports.handlePawaPayWebhook = exports.initiateRefund = exports.initiatePayout = exports.initiateDeposit = exports.getWalletOverview = exports.getGatewayBalance = void 0;
 const crypto_1 = __importDefault(require("crypto"));
 const axios_1 = __importDefault(require("axios"));
 const prisma_1 = __importDefault(require("../utils/prisma"));
@@ -43,6 +43,8 @@ const INTOUCHPAY_PARTNER_PASSWORD = String(process.env.INTOUCHPAY_PARTNER_PASSWO
 const INTOUCHPAY_BASE_URL = String(process.env.INTOUCHPAY_BASE_URL || 'https://www.intouchpay.co.rw/api').replace(/\/+$/, '');
 const INTOUCHPAY_DEFAULT_WITHDRAW_CHARGE = String(process.env.INTOUCHPAY_WITHDRAW_CHARGE || '1').trim();
 const INTOUCHPAY_DEFAULT_SID = String(process.env.INTOUCHPAY_SID || '1').trim();
+const INTOUCHPAY_SANDBOX = /^(1|true|yes)$/i.test(String(process.env.INTOUCHPAY_SANDBOX || '').trim())
+    || /^test/i.test(INTOUCHPAY_USERNAME);
 const DEPOSIT_CALLBACK_URL = process.env.PAYPACK_DEPOSIT_CALLBACK_URL
     || process.env.PAWAPAY_DEPOSIT_CALLBACK_URL
     || process.env.INTOUCHPAY_CALLBACK_URL
@@ -88,7 +90,13 @@ const gatewayBaseUrl = gatewayMode === 'paypack'
             : 'n/a';
 console.log(`[payments] gateway=${gatewayMode} base=${gatewayBaseUrl}`);
 const hasGatewayAuth = () => gatewayMode !== 'none';
-const isSandboxEnvironment = () => gatewayMode === 'pawapay' && /sandbox/i.test(PAWAPAY_BASE_URL);
+const isSandboxEnvironment = () => {
+    if (gatewayMode === 'pawapay')
+        return /sandbox/i.test(PAWAPAY_BASE_URL);
+    if (gatewayMode === 'intouchpay')
+        return INTOUCHPAY_SANDBOX;
+    return false;
+};
 const createTxRef = (prefix, userId) => `${prefix}_${userId}_${Date.now()}`;
 const createProviderId = () => crypto_1.default.randomUUID();
 const createIdempotencyKey = (seed) => crypto_1.default.createHash('sha256').update(seed).digest('hex').slice(0, 32);
@@ -97,6 +105,45 @@ const SUCCESS_STATUSES = new Set(['SUCCESSFUL', 'SUCCESS', 'COMPLETED']);
 const FAILED_STATUSES = new Set(['FAILED', 'FAILURE', 'REJECTED', 'CANCELLED', 'CANCELED', 'ERROR']);
 const PENDING_STATUSES = new Set(['PENDING', 'PROCESSING', 'CREATED', 'INITIATED']);
 const isSuccessfulStatus = (status) => SUCCESS_STATUSES.has(normalizeStatus(status));
+const isFailedStatus = (status) => FAILED_STATUSES.has(normalizeStatus(status));
+const isPendingStatus = (status) => PENDING_STATUSES.has(normalizeStatus(status));
+const WALLET_CREDIT_TYPES = new Set(['DEPOSIT', 'REFUND']);
+const WALLET_DEBIT_TYPES = new Set(['PAYOUT', 'PROFILE_UNLOCK', 'JOB_POSTING']);
+const walletDirectionFromType = (type) => {
+    const normalizedType = normalizeStatus(type);
+    if (WALLET_CREDIT_TYPES.has(normalizedType))
+        return 'credit';
+    if (WALLET_DEBIT_TYPES.has(normalizedType))
+        return 'debit';
+    return 'neutral';
+};
+const getWalletDelta = (type, amount) => {
+    const parsedAmount = toNumber(amount, 0);
+    const direction = walletDirectionFromType(type);
+    if (direction === 'credit')
+        return parsedAmount;
+    if (direction === 'debit')
+        return -parsedAmount;
+    return 0;
+};
+const getWalletBalanceForUser = (userId) => __awaiter(void 0, void 0, void 0, function* () {
+    const successfulPayments = yield prisma_1.default.payment.findMany({
+        where: {
+            employerId: userId,
+            status: 'SUCCESSFUL'
+        },
+        select: {
+            type: true,
+            amount: true
+        }
+    });
+    return successfulPayments.reduce((sum, payment) => sum + getWalletDelta(payment.type, payment.amount), 0);
+});
+const JOB_POST_FEE_PERCENTAGE_RAW = Number(process.env.JOB_POST_FEE_PERCENTAGE || '0.1');
+const JOB_POST_FEE_PERCENTAGE = Number.isFinite(JOB_POST_FEE_PERCENTAGE_RAW) && JOB_POST_FEE_PERCENTAGE_RAW > 0
+    ? JOB_POST_FEE_PERCENTAGE_RAW
+    : 0.1;
+const calculateJobPostingFee = (salaryMax) => Math.ceil(salaryMax * JOB_POST_FEE_PERCENTAGE);
 const toPaymentStatus = (status) => {
     const normalized = normalizeStatus(status);
     if (!normalized)
@@ -387,6 +434,15 @@ const extractErrorMessage = (error) => {
     if (typeof providerMessage === 'string')
         return providerMessage;
     return JSON.stringify(providerMessage || 'Unknown gateway error');
+};
+const extractProviderStatusMessage = (raw) => {
+    var _a;
+    const message = (raw === null || raw === void 0 ? void 0 : raw.statusdesc)
+        || (raw === null || raw === void 0 ? void 0 : raw.message)
+        || ((_a = raw === null || raw === void 0 ? void 0 : raw.failureReason) === null || _a === void 0 ? void 0 : _a.failureMessage)
+        || (raw === null || raw === void 0 ? void 0 : raw.failureReason)
+        || '';
+    return String(message || '').trim();
 };
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const confirmPaypackTransaction = (reference) => __awaiter(void 0, void 0, void 0, function* () {
@@ -702,6 +758,96 @@ const getGatewayBalance = (req, res) => __awaiter(void 0, void 0, void 0, functi
     }
 });
 exports.getGatewayBalance = getGatewayBalance;
+const getWalletOverview = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
+    try {
+        const userId = (_a = req.user) === null || _a === void 0 ? void 0 : _a.userId;
+        if (!userId)
+            return res.status(401).json({ message: 'Unauthorized' });
+        const limit = Number.isFinite(Number(req.query.limit))
+            ? Math.min(Math.max(Math.floor(Number(req.query.limit)), 1), 100)
+            : 30;
+        const payments = yield prisma_1.default.payment.findMany({
+            where: {
+                employerId: userId
+            },
+            orderBy: { createdAt: 'desc' },
+            take: limit,
+            select: {
+                id: true,
+                transactionId: true,
+                amount: true,
+                currency: true,
+                status: true,
+                type: true,
+                createdAt: true,
+                maidId: true
+            }
+        });
+        const allSuccessful = yield prisma_1.default.payment.findMany({
+            where: {
+                employerId: userId,
+                status: 'SUCCESSFUL'
+            },
+            select: {
+                type: true,
+                amount: true
+            }
+        });
+        let availableBalance = 0;
+        for (const item of allSuccessful) {
+            availableBalance += getWalletDelta(item.type, item.amount);
+        }
+        let pendingIn = 0;
+        let pendingOut = 0;
+        for (const item of payments) {
+            if (!isPendingStatus(item.status))
+                continue;
+            const delta = getWalletDelta(item.type, item.amount);
+            if (delta > 0)
+                pendingIn += delta;
+            if (delta < 0)
+                pendingOut += Math.abs(delta);
+        }
+        const transactions = payments.map((item) => {
+            const direction = walletDirectionFromType(item.type);
+            const titleMap = {
+                DEPOSIT: 'Wallet Deposit',
+                PAYOUT: 'Wallet Withdrawal',
+                REFUND: 'Refund',
+                PROFILE_UNLOCK: 'Maid Profile Unlock',
+                JOB_POSTING: 'Job Posting Fee'
+            };
+            const normalizedType = normalizeStatus(item.type);
+            return {
+                id: item.id,
+                transactionId: item.transactionId,
+                amount: Number(item.amount || 0),
+                currency: String(item.currency || 'RWF').toUpperCase(),
+                status: normalizeStatus(item.status) || 'UNKNOWN',
+                type: normalizedType,
+                direction,
+                title: titleMap[normalizedType] || normalizedType.replace(/_/g, ' '),
+                createdAt: item.createdAt,
+                maidId: item.maidId
+            };
+        });
+        return res.json({
+            summary: {
+                availableBalance: Number(availableBalance.toFixed(2)),
+                pendingIn: Number(pendingIn.toFixed(2)),
+                pendingOut: Number(pendingOut.toFixed(2)),
+                currency: 'RWF'
+            },
+            transactions
+        });
+    }
+    catch (error) {
+        console.error('Failed to fetch wallet overview:', error);
+        return res.status(500).json({ message: 'Failed to fetch wallet overview' });
+    }
+});
+exports.getWalletOverview = getWalletOverview;
 const updatePaymentStatus = (txRef_1, status_1, ...args_1) => __awaiter(void 0, [txRef_1, status_1, ...args_1], void 0, function* (txRef, status, metadata = {}) {
     try {
         const existing = yield prisma_1.default.payment.findUnique({ where: { transactionId: txRef } });
@@ -771,21 +917,31 @@ const initiateDeposit = (req, res) => __awaiter(void 0, void 0, void 0, function
                 ]
         });
         const txRef = providerData.reference || safeClientReferenceId;
+        const providerStatus = toPaymentStatus(providerData.status);
         const payment = yield upsertPaymentByReference({
             transactionId: txRef,
             employerId: userId,
             maidId: maidId ? Number(maidId) : null,
             amount: parsedAmount,
             currency: safeCurrency,
-            status: toPaymentStatus(providerData.status),
+            status: providerStatus,
             type: 'DEPOSIT'
         });
+        if (isFailedStatus(providerStatus)) {
+            const providerMessage = extractProviderStatusMessage(providerData.raw);
+            return res.status(400).json({
+                message: providerMessage
+                    ? `Payment request failed: ${providerMessage}`
+                    : 'Payment request was rejected by the provider',
+                status: providerStatus
+            });
+        }
         const momoPromptLikely = gatewayMode === 'paypack'
             ? PAYPACK_WEBHOOK_MODE === 'production'
             : gatewayMode === 'pawapay'
                 ? !isSandboxEnvironment()
                 : gatewayMode === 'intouchpay'
-                    ? true
+                    ? !isSandboxEnvironment()
                     : false;
         return res.json({
             paymentId: payment.id,
@@ -832,6 +988,15 @@ const initiatePayout = (req, res) => __awaiter(void 0, void 0, void 0, function*
         const parsedAmount = sanitizeAmount(amount);
         if (!parsedAmount) {
             return res.status(400).json({ message: 'Missing required payout field: amount' });
+        }
+        const availableBalance = yield getWalletBalanceForUser(userId);
+        if (parsedAmount > availableBalance) {
+            return res.status(400).json({
+                message: 'Insufficient wallet balance for this withdrawal',
+                availableBalance: Number(availableBalance.toFixed(2)),
+                requestedAmount: Number(parsedAmount.toFixed(2)),
+                currency: normalizeCurrency(currency)
+            });
         }
         const safeCurrency = normalizeCurrency(currency);
         const recipientPhoneNumber = normalizePhoneForCurrency(phoneNumber || account_number, safeCurrency);
@@ -1114,11 +1279,15 @@ const verifyProfileUnlock = (req, res) => __awaiter(void 0, void 0, void 0, func
             }).catch(() => null);
         }
         if (!isSuccessfulStatus(providerStatus)) {
+            const providerMessage = extractProviderStatusMessage(gatewayTx.raw);
             return res.status(400).json({
                 message: providerStatus === 'PENDING'
                     ? 'Payment is still pending confirmation. Please try again.'
-                    : 'Payment verification failed',
-                status: providerStatus || 'UNKNOWN'
+                    : providerMessage
+                        ? `Payment verification failed: ${providerMessage}`
+                        : 'Payment verification failed',
+                status: providerStatus || 'UNKNOWN',
+                providerMessage: providerMessage || null
             });
         }
         const { payment, unlock } = yield finalizeUnlock(gatewayTx.amount || (existingPayment === null || existingPayment === void 0 ? void 0 : existingPayment.amount) || 0, gatewayTx.currency || (existingPayment === null || existingPayment === void 0 ? void 0 : existingPayment.currency) || 'RWF');
@@ -1138,6 +1307,136 @@ const verifyProfileUnlock = (req, res) => __awaiter(void 0, void 0, void 0, func
     }
 });
 exports.verifyProfileUnlock = verifyProfileUnlock;
+const verifyJobPostingPayment = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a, _b, _c, _d;
+    try {
+        const employerId = (_a = req.user) === null || _a === void 0 ? void 0 : _a.userId;
+        if (!employerId)
+            return res.status(401).json({ message: 'Unauthorized' });
+        if (!hasGatewayAuth()) {
+            return res.status(500).json({ message: 'Payment gateway is not configured' });
+        }
+        const verificationId = String(((_b = req.body) === null || _b === void 0 ? void 0 : _b.transaction_id) || '').trim();
+        const salaryMax = sanitizeAmount((_c = req.body) === null || _c === void 0 ? void 0 : _c.salaryMax);
+        if (!verificationId || !salaryMax) {
+            return res.status(400).json({ message: 'Missing required fields: transaction_id, salaryMax' });
+        }
+        const requiredAmount = calculateJobPostingFee(salaryMax);
+        const existingPayment = yield prisma_1.default.payment.findUnique({
+            where: { transactionId: verificationId }
+        });
+        if (existingPayment && existingPayment.employerId !== employerId) {
+            return res.status(403).json({ message: 'Transaction does not belong to this user' });
+        }
+        if ((existingPayment === null || existingPayment === void 0 ? void 0 : existingPayment.type) === 'JOB_POSTING_USED') {
+            return res.status(400).json({ message: 'This payment has already been used to post a job.' });
+        }
+        if ((existingPayment === null || existingPayment === void 0 ? void 0 : existingPayment.type)
+            && !['DEPOSIT', 'JOB_POSTING', 'JOB_POSTING_USED'].includes(existingPayment.type)) {
+            return res.status(400).json({
+                message: `This transaction is reserved for ${existingPayment.type} and cannot be used for job posting.`
+            });
+        }
+        const ensureJobPostingPayment = (amount, currency) => __awaiter(void 0, void 0, void 0, function* () {
+            return upsertPaymentByReference({
+                transactionId: verificationId,
+                employerId,
+                amount: Number(amount) || 0,
+                currency: String(currency || (existingPayment === null || existingPayment === void 0 ? void 0 : existingPayment.currency) || 'RWF'),
+                status: 'SUCCESSFUL',
+                type: 'JOB_POSTING'
+            });
+        });
+        if (existingPayment && isSuccessfulStatus(existingPayment.status)) {
+            if (Number(existingPayment.amount || 0) + 0.001 < requiredAmount) {
+                return res.status(400).json({
+                    message: `Payment amount is too low for this job post. Required ${requiredAmount} RWF, paid ${Number(existingPayment.amount || 0)} RWF.`,
+                    status: 'UNDERPAID',
+                    requiredAmount,
+                    paidAmount: Number(existingPayment.amount || 0)
+                });
+            }
+            yield prisma_1.default.payment.update({
+                where: { id: existingPayment.id },
+                data: { type: 'JOB_POSTING' }
+            }).catch(() => null);
+            return res.json({
+                message: 'Job posting payment verified',
+                transaction_id: verificationId,
+                requiredAmount,
+                paidAmount: Number(existingPayment.amount || 0)
+            });
+        }
+        let gatewayTx = null;
+        let providerError = null;
+        try {
+            gatewayTx = yield fetchGatewayTransaction(verificationId, 'deposit');
+        }
+        catch (directError) {
+            providerError = directError;
+        }
+        if (!gatewayTx) {
+            const existingStatus = normalizeStatus(existingPayment === null || existingPayment === void 0 ? void 0 : existingPayment.status);
+            if (existingStatus === 'PENDING') {
+                return res.status(400).json({
+                    message: 'Payment is still pending confirmation. Complete payment and try again.'
+                });
+            }
+            return res.status(400).json({
+                message: 'Unable to verify payment yet. Please try again shortly.',
+                debug: extractErrorMessage(providerError)
+            });
+        }
+        const providerStatus = toPaymentStatus(gatewayTx.status);
+        if (existingPayment) {
+            yield prisma_1.default.payment.update({
+                where: { id: existingPayment.id },
+                data: {
+                    status: providerStatus,
+                    amount: gatewayTx.amount || existingPayment.amount,
+                    currency: gatewayTx.currency || existingPayment.currency
+                }
+            }).catch(() => null);
+        }
+        if (!isSuccessfulStatus(providerStatus)) {
+            const providerMessage = extractProviderStatusMessage(gatewayTx.raw);
+            return res.status(400).json({
+                message: providerStatus === 'PENDING'
+                    ? 'Payment is still pending confirmation. Please try again.'
+                    : providerMessage
+                        ? `Payment verification failed: ${providerMessage}`
+                        : 'Payment verification failed',
+                status: providerStatus || 'UNKNOWN',
+                providerMessage: providerMessage || null
+            });
+        }
+        const paidAmount = Number(gatewayTx.amount || (existingPayment === null || existingPayment === void 0 ? void 0 : existingPayment.amount) || 0);
+        const paidCurrency = gatewayTx.currency || (existingPayment === null || existingPayment === void 0 ? void 0 : existingPayment.currency) || 'RWF';
+        yield ensureJobPostingPayment(paidAmount, paidCurrency);
+        if (paidAmount + 0.001 < requiredAmount) {
+            return res.status(400).json({
+                message: `Payment amount is too low for this job post. Required ${requiredAmount} RWF, paid ${paidAmount} RWF.`,
+                status: 'UNDERPAID',
+                requiredAmount,
+                paidAmount
+            });
+        }
+        return res.json({
+            message: 'Job posting payment verified',
+            transaction_id: verificationId,
+            requiredAmount,
+            paidAmount
+        });
+    }
+    catch (error) {
+        console.error('Job posting payment verification failed:', ((_d = error.response) === null || _d === void 0 ? void 0 : _d.data) || error.message || error);
+        return res.status(500).json({
+            message: 'Internal server error during job payment verification',
+            debug: extractErrorMessage(error)
+        });
+    }
+});
+exports.verifyJobPostingPayment = verifyJobPostingPayment;
 const ensurePaymentAccess = (userId, transactionId, res) => __awaiter(void 0, void 0, void 0, function* () {
     const payment = yield prisma_1.default.payment.findUnique({ where: { transactionId } });
     if (payment && payment.employerId !== userId) {

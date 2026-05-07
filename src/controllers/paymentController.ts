@@ -110,6 +110,42 @@ const FAILED_STATUSES = new Set(['FAILED', 'FAILURE', 'REJECTED', 'CANCELLED', '
 const PENDING_STATUSES = new Set(['PENDING', 'PROCESSING', 'CREATED', 'INITIATED']);
 const isSuccessfulStatus = (status: unknown) => SUCCESS_STATUSES.has(normalizeStatus(status));
 const isFailedStatus = (status: unknown) => FAILED_STATUSES.has(normalizeStatus(status));
+const isPendingStatus = (status: unknown) => PENDING_STATUSES.has(normalizeStatus(status));
+
+const WALLET_CREDIT_TYPES = new Set(['DEPOSIT', 'REFUND']);
+const WALLET_DEBIT_TYPES = new Set(['PAYOUT', 'PROFILE_UNLOCK', 'JOB_POSTING']);
+
+const walletDirectionFromType = (type: unknown): 'credit' | 'debit' | 'neutral' => {
+    const normalizedType = normalizeStatus(type);
+    if (WALLET_CREDIT_TYPES.has(normalizedType)) return 'credit';
+    if (WALLET_DEBIT_TYPES.has(normalizedType)) return 'debit';
+    return 'neutral';
+};
+
+const getWalletDelta = (type: unknown, amount: unknown) => {
+    const parsedAmount = toNumber(amount, 0);
+    const direction = walletDirectionFromType(type);
+    if (direction === 'credit') return parsedAmount;
+    if (direction === 'debit') return -parsedAmount;
+    return 0;
+};
+
+const getWalletBalanceForUser = async (userId: number) => {
+    const successfulPayments = await prisma.payment.findMany({
+        where: {
+            employerId: userId,
+            status: 'SUCCESSFUL'
+        },
+        select: {
+            type: true,
+            amount: true
+        }
+    });
+
+    const balance = successfulPayments.reduce((sum, payment) => sum + getWalletDelta(payment.type, payment.amount), 0);
+    // Ensure balance never goes negative - min balance is 0
+    return Math.max(0, balance);
+};
 const JOB_POST_FEE_PERCENTAGE_RAW = Number(process.env.JOB_POST_FEE_PERCENTAGE || '0.1');
 const JOB_POST_FEE_PERCENTAGE = Number.isFinite(JOB_POST_FEE_PERCENTAGE_RAW) && JOB_POST_FEE_PERCENTAGE_RAW > 0
     ? JOB_POST_FEE_PERCENTAGE_RAW
@@ -895,24 +931,125 @@ export const getGatewayBalance = async (req: AuthRequest, res: Response) => {
     }
 };
 
+export const getWalletOverview = async (req: AuthRequest, res: Response) => {
+    try {
+        const userId = req.user?.userId;
+        if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+        const limit = Number.isFinite(Number(req.query.limit))
+            ? Math.min(Math.max(Math.floor(Number(req.query.limit)), 1), 100)
+            : 30;
+
+        const payments = await prisma.payment.findMany({
+            where: {
+                employerId: userId
+            },
+            orderBy: { createdAt: 'desc' },
+            take: limit,
+            select: {
+                id: true,
+                transactionId: true,
+                amount: true,
+                currency: true,
+                status: true,
+                type: true,
+                createdAt: true,
+                maidId: true
+            }
+        });
+
+        const allSuccessful = await prisma.payment.findMany({
+            where: {
+                employerId: userId,
+                status: 'SUCCESSFUL'
+            },
+            select: {
+                type: true,
+                amount: true
+            }
+        });
+
+        let availableBalance = 0;
+        for (const item of allSuccessful) {
+            availableBalance += getWalletDelta(item.type, item.amount);
+        }
+        // Ensure balance never goes negative - min balance is 0
+        availableBalance = Math.max(0, availableBalance);
+
+        let pendingIn = 0;
+        let pendingOut = 0;
+        for (const item of payments) {
+            if (!isPendingStatus(item.status)) continue;
+            const delta = getWalletDelta(item.type, item.amount);
+            if (delta > 0) pendingIn += delta;
+            if (delta < 0) pendingOut += Math.abs(delta);
+        }
+
+        const transactions = payments.map((item) => {
+            const direction = walletDirectionFromType(item.type);
+            const titleMap: Record<string, string> = {
+                DEPOSIT: 'Wallet Deposit',
+                PAYOUT: 'Wallet Withdrawal',
+                REFUND: 'Refund',
+                PROFILE_UNLOCK: 'Maid Profile Unlock',
+                JOB_POSTING: 'Job Posting Fee'
+            };
+            const normalizedType = normalizeStatus(item.type);
+            return {
+                id: item.id,
+                transactionId: item.transactionId,
+                amount: Number(item.amount || 0),
+                currency: String(item.currency || 'RWF').toUpperCase(),
+                status: normalizeStatus(item.status) || 'UNKNOWN',
+                type: normalizedType,
+                direction,
+                title: titleMap[normalizedType] || normalizedType.replace(/_/g, ' '),
+                createdAt: item.createdAt,
+                maidId: item.maidId
+            };
+        });
+
+        return res.json({
+            summary: {
+                availableBalance: Number(availableBalance.toFixed(2)),
+                pendingIn: Number(pendingIn.toFixed(2)),
+                pendingOut: Number(pendingOut.toFixed(2)),
+                currency: 'RWF'
+            },
+            transactions
+        });
+    } catch (error) {
+        console.error('Failed to fetch wallet overview:', error);
+        return res.status(500).json({ message: 'Failed to fetch wallet overview' });
+    }
+};
+
 const updatePaymentStatus = async (txRef: string, status: string, metadata: any = {}) => {
     try {
         const existing = await prisma.payment.findUnique({ where: { transactionId: txRef } });
         if (!existing) {
-            console.warn('Webhook received for unknown transaction reference:', txRef);
+            console.warn(`⚠️ Webhook received for unknown transaction reference: ${txRef}`);
             return;
         }
+
+        console.log(`📝 Updating payment ${txRef}: ${existing.status} → ${status} (type=${existing.type})`);
 
         await prisma.payment.update({
             where: { transactionId: txRef },
             data: {
                 status: toPaymentStatus(status),
+                // CRITICAL: Always preserve type field for balance calculation
+                type: existing.type || 'UNKNOWN',
                 ...(metadata?.amount !== undefined ? { amount: toNumber(metadata.amount, existing.amount) } : {}),
                 ...(metadata?.currency ? { currency: String(metadata.currency) } : {})
             }
         });
+
+        if (toPaymentStatus(status) === 'SUCCESSFUL') {
+            console.log(`✅ Payment ${txRef} marked as SUCCESSFUL - balance should update now`);
+        }
     } catch (error) {
-        console.error('Failed to update payment status from webhook:', error);
+        console.error(`❌ Failed to update payment status for ${txRef}:`, error);
     }
 };
 
@@ -1072,6 +1209,16 @@ export const initiatePayout = async (req: AuthRequest, res: Response) => {
             return res.status(400).json({ message: 'Missing required payout field: amount' });
         }
 
+        const availableBalance = await getWalletBalanceForUser(userId);
+        if (parsedAmount > availableBalance) {
+            return res.status(400).json({
+                message: 'Insufficient wallet balance for this withdrawal',
+                availableBalance: Number(availableBalance.toFixed(2)),
+                requestedAmount: Number(parsedAmount.toFixed(2)),
+                currency: normalizeCurrency(currency)
+            });
+        }
+
         const safeCurrency = normalizeCurrency(currency);
         const recipientPhoneNumber = normalizePhoneForCurrency(phoneNumber || account_number, safeCurrency);
         const recipientProvider = String(provider || account_bank || DEFAULT_PAYOUT_PROVIDER || '').trim();
@@ -1207,8 +1354,13 @@ export const initiateRefund = async (req: AuthRequest, res: Response) => {
 
 export const handlePawaPayWebhook = async (req: Request, res: Response) => {
     try {
+        console.log(`📥 Webhook received from ${gatewayMode}:`, {
+            headers: req.headers,
+            body: req.body
+        });
+
         if (!isWebhookValid(req)) {
-            console.warn('Invalid payment webhook signature');
+            console.warn('⚠️ Invalid payment webhook signature');
             return res.status(401).json({ message: 'Invalid webhook signature' });
         }
 
@@ -1234,16 +1386,21 @@ export const handlePawaPayWebhook = async (req: Request, res: Response) => {
         const amount = toNumber(data.amount ?? data.currency?.amount ?? 0);
         const currency = String(data.currency || 'RWF');
 
+        console.log(`✅ Webhook parsed - txRef=${txRef}, status=${status}, amount=${amount}`);
+
         if (txRef) {
             await updatePaymentStatus(txRef, status, {
                 amount: amount || undefined,
                 currency: currency || undefined
             });
+            console.log(`✅ Payment status updated for txRef=${txRef}`);
+        } else {
+            console.warn('⚠️ No transaction reference found in webhook payload');
         }
 
         return res.json({ status: 'success' });
     } catch (error: any) {
-        console.error('Webhook handling failed:', error.response?.data || error.message || error);
+        console.error('❌ Webhook handling failed:', error.response?.data || error.message || error);
         return res.status(500).json({ message: 'Failed to handle webhook', debug: extractErrorMessage(error) });
     }
 };
@@ -1593,30 +1750,43 @@ export const getDepositStatus = async (req: AuthRequest, res: Response) => {
         const payment = await ensurePaymentAccess(userId, depositId, res);
         if (payment === null) return;
 
+        console.log(`📱 Checking deposit status for txRef=${depositId}, current status=${payment.status}`);
+
         const gatewayTx = await fetchGatewayTransaction(depositId, 'deposit');
         const providerStatus = toPaymentStatus(gatewayTx.status);
 
-        if (payment) {
+        console.log(`🔄 Gateway reports status=${providerStatus} for deposit ${depositId}`);
+
+        // Only update if status changed
+        if (payment && providerStatus !== payment.status) {
+            console.log(`✅ Updating deposit ${depositId} from ${payment.status} to ${providerStatus}`);
             await prisma.payment.update({
                 where: { id: payment.id },
                 data: {
                     status: providerStatus,
                     amount: gatewayTx.amount || payment.amount,
-                    currency: gatewayTx.currency || payment.currency
+                    currency: gatewayTx.currency || payment.currency,
+                    // CRITICAL: Preserve type to ensure balance calculation includes this payment
+                    type: payment.type || 'DEPOSIT'
                 }
             }).catch(() => null);
         }
 
         return res.json({
             depositId,
-            status: providerStatus || null,
+            localStatus: payment.status,
+            providerStatus,
+            updated: providerStatus !== payment.status,
+            amount: payment.amount,
+            currency: payment.currency,
             deposit: gatewayTx.raw
         });
     } catch (error: any) {
-        console.error('Get deposit status failed:', error.response?.data || error.message || error);
+        console.error('❌ Get deposit status failed:', error.response?.data || error.message || error);
         return res.status(400).json({
             message: 'Failed to fetch deposit status',
-            debug: extractErrorMessage(error)
+            debug: extractErrorMessage(error),
+            gateway: gatewayMode
         });
     }
 };
@@ -1681,7 +1851,9 @@ export const getPayoutStatus = async (req: AuthRequest, res: Response) => {
                 data: {
                     status: providerStatus,
                     amount: gatewayTx.amount || payment.amount,
-                    currency: gatewayTx.currency || payment.currency
+                    currency: gatewayTx.currency || payment.currency,
+                    // CRITICAL: Preserve type to ensure balance calculation includes this payment
+                    type: payment.type || 'PAYOUT'
                 }
             }).catch(() => null);
         }
@@ -1727,7 +1899,9 @@ export const getRefundStatus = async (req: AuthRequest, res: Response) => {
                 data: {
                     status: providerStatus,
                     amount: gatewayTx.amount || payment.amount,
-                    currency: gatewayTx.currency || payment.currency
+                    currency: gatewayTx.currency || payment.currency,
+                    // CRITICAL: Preserve type to ensure balance calculation includes this payment
+                    type: payment.type || 'REFUND'
                 }
             }).catch(() => null);
         }

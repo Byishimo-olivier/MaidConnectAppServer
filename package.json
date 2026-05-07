@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "postinstall": "node node_modules/prisma/build/index.js generate",
-    "start": "node dist/index.js",
+    "start": "npm run build && node dist/index.js",
     "dev": "nodemon src/index.ts",
     "build": "tsc",
     "test": "echo \"Error: no test specified\" && exit 1"

@@ -11,12 +11,14 @@ import {
     resendDepositCallback,
     getPayoutStatus,
     getRefundStatus,
-    getGatewayBalance
+    getGatewayBalance,
+    getWalletOverview
 } from '../controllers/paymentController';
 import { authenticateToken } from '../middleware/auth';
 
 const router = Router();
 
+router.get('/wallet', authenticateToken, getWalletOverview);
 router.post('/deposit', authenticateToken, initiateDeposit);
 router.get('/deposit/:depositId', authenticateToken, getDepositStatus);
 router.get('/balance', authenticateToken, getGatewayBalance);

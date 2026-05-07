@@ -1,4 +1,4 @@
-import { ApplicationStatus, ContractStatus, JobStatus, Role } from '@prisma/client';
+import { ApplicationStatus, ContractStatus, JobStatus, Prisma, Role } from '@prisma/client';
 import { Response } from 'express';
 import prisma from '../utils/prisma';
 import { AuthRequest } from '../middleware/auth';
@@ -42,6 +42,54 @@ const parseEnum = <T extends string>(value: unknown, allowed: readonly T[]) => {
 };
 
 const normalizeSearch = (value: unknown) => String(getQueryValue(value) || '').trim();
+
+const toNullableString = (value: unknown) => {
+    if (value === undefined || value === null) return null;
+    const text = String(value).trim();
+    return text ? text : null;
+};
+
+const toOptionalInt = (value: unknown) => {
+    if (value === undefined || value === null || value === '') return undefined;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? Math.trunc(parsed) : undefined;
+};
+
+const toOptionalFloat = (value: unknown) => {
+    if (value === undefined || value === null || value === '') return undefined;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+};
+
+const toOptionalBoolean = (value: unknown) => {
+    if (value === undefined || value === null || value === '') return undefined;
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'number') return value !== 0;
+    const normalized = String(value).trim().toLowerCase();
+    if (['true', '1', 'yes', 'on'].includes(normalized)) return true;
+    if (['false', '0', 'no', 'off'].includes(normalized)) return false;
+    return undefined;
+};
+
+const toOptionalDate = (value: unknown) => {
+    if (value === undefined || value === null || value === '') return undefined;
+    const date = new Date(String(value));
+    if (Number.isNaN(date.getTime())) return undefined;
+    return date;
+};
+
+const toStringArray = (value: unknown) => {
+    if (value === undefined || value === null || value === '') return undefined;
+    if (Array.isArray(value)) {
+        return value
+            .map((item) => String(item || '').trim())
+            .filter(Boolean);
+    }
+    return String(value)
+        .split(',')
+        .map((item) => item.trim())
+        .filter(Boolean);
+};
 
 const formatListResponse = <T>(items: T[], total: number, page: number, limit: number) => ({
     items,
@@ -245,7 +293,35 @@ export const getAdminUsers = async (req: AuthRequest, res: Response) => {
                     fullName: true,
                     email: true,
                     phone: true,
+                    address: true,
+                    description: true,
                     role: true,
+                    dob: true,
+                    gender: true,
+                    nidNumber: true,
+                    maritalStatus: true,
+                    childrenCount: true,
+                    country: true,
+                    provinceDistrict: true,
+                    sectorCellVillage: true,
+                    willingToRelocate: true,
+                    yearsExperience: true,
+                    prevEmployer: true,
+                    prevEmployerContact: true,
+                    workTypes: true,
+                    reasonForLeaving: true,
+                    highestEducation: true,
+                    languages: true,
+                    specialSkills: true,
+                    drivingLicense: true,
+                    availabilityType: true,
+                    startDate: true,
+                    preferredHours: true,
+                    expectedSalary: true,
+                    salaryNegotiable: true,
+                    emergencyName: true,
+                    emergencyRelation: true,
+                    emergencyPhone: true,
                     createdAt: true,
                     _count: {
                         select: {
@@ -531,6 +607,81 @@ export const getAdminPayments = async (req: AuthRequest, res: Response) => {
     }
 };
 
+export const getAdminPaymentsOverview = async (req: AuthRequest, res: Response) => {
+    try {
+        const months = parsePositiveInt(req.query.months, 6, 24);
+        const now = new Date();
+        const startWindow = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - (months - 1), 1, 0, 0, 0, 0));
+
+        const payments = await prisma.payment.findMany({
+            where: {
+                createdAt: { gte: startWindow }
+            },
+            select: {
+                amount: true,
+                status: true,
+                createdAt: true
+            },
+            orderBy: { createdAt: 'asc' }
+        });
+
+        const trendMap: Record<string, { volume: number; transactions: number }> = {};
+        const monthLabels: string[] = [];
+
+        for (let i = months - 1; i >= 0; i -= 1) {
+            const monthDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1, 0, 0, 0, 0));
+            const label = monthDate.toLocaleString('en-US', { month: 'short', year: '2-digit', timeZone: 'UTC' });
+            monthLabels.push(label);
+            trendMap[label] = { volume: 0, transactions: 0 };
+        }
+
+        let successful = 0;
+        let pending = 0;
+        let failed = 0;
+        let totalVolume = 0;
+
+        for (const payment of payments) {
+            const paymentDate = new Date(payment.createdAt);
+            if (Number.isNaN(paymentDate.getTime())) continue;
+
+            const label = paymentDate.toLocaleString('en-US', { month: 'short', year: '2-digit', timeZone: 'UTC' });
+            if (!trendMap[label]) continue;
+
+            const amount = Number(payment.amount || 0);
+            trendMap[label].volume += amount;
+            trendMap[label].transactions += 1;
+            totalVolume += amount;
+
+            const normalizedStatus = String(payment.status || '').trim().toUpperCase();
+            if (normalizedStatus === 'SUCCESSFUL') successful += 1;
+            else if (normalizedStatus === 'PENDING') pending += 1;
+            else if (normalizedStatus === 'FAILED') failed += 1;
+        }
+
+        const trendData = monthLabels.map((label) => ({
+            label,
+            volume: Number(trendMap[label].volume.toFixed(2)),
+            transactions: trendMap[label].transactions
+        }));
+
+        return res.json({
+            months,
+            generatedAt: now.toISOString(),
+            trendData,
+            summary: {
+                transactions: payments.length,
+                totalVolume: Number(totalVolume.toFixed(2)),
+                successful,
+                pending,
+                failed
+            }
+        });
+    } catch (error) {
+        console.error('Failed to fetch admin payments overview:', error);
+        return res.status(500).json({ message: 'Failed to fetch payments overview' });
+    }
+};
+
 export const getAdminDisputes = async (req: AuthRequest, res: Response) => {
     try {
         const { page, limit, skip } = parsePagination(req);
@@ -631,5 +782,521 @@ export const getAdminReviews = async (req: AuthRequest, res: Response) => {
     } catch (error) {
         console.error('Failed to fetch admin reviews:', error);
         return res.status(500).json({ message: 'Failed to fetch reviews' });
+    }
+};
+
+// CREATE OPERATIONS
+export const createAdminUser = async (req: AuthRequest, res: Response) => {
+    try {
+        const {
+            email, password, fullName, phone, role, address, description,
+            dob, gender, nidNumber, maritalStatus, childrenCount,
+            country, provinceDistrict, sectorCellVillage, willingToRelocate,
+            yearsExperience, prevEmployer, prevEmployerContact, workTypes,
+            reasonForLeaving, highestEducation, languages, specialSkills,
+            drivingLicense, availabilityType, startDate, preferredHours,
+            expectedSalary, salaryNegotiable, emergencyName, emergencyRelation, emergencyPhone
+        } = req.body;
+
+        if (!email || !password || !fullName) {
+            return res.status(400).json({ message: 'Email, password, and fullName are required' });
+        }
+
+        const normalizedEmail = String(email).trim().toLowerCase();
+
+        const existing = await prisma.user.findFirst({
+            where: { email: { equals: normalizedEmail, mode: 'insensitive' } }
+        });
+
+        if (existing) {
+            return res.status(400).json({ message: 'Email already exists' });
+        }
+
+        const userRole = parseEnum(role, ROLE_VALUES) || Role.EMPLOYER;
+        const bcrypt = require('bcryptjs');
+        const hashedPassword = await bcrypt.hash(password, 10);
+
+        const user = await prisma.user.create({
+            data: {
+                email: normalizedEmail,
+                password: hashedPassword,
+                fullName: toNullableString(fullName),
+                phone: toNullableString(phone),
+                address: toNullableString(address),
+                description: toNullableString(description),
+                role: userRole,
+                dob: toOptionalDate(dob),
+                gender: toNullableString(gender),
+                nidNumber: toNullableString(nidNumber),
+                maritalStatus: toNullableString(maritalStatus),
+                childrenCount: toOptionalInt(childrenCount),
+                country: toNullableString(country),
+                provinceDistrict: toNullableString(provinceDistrict),
+                sectorCellVillage: toNullableString(sectorCellVillage),
+                willingToRelocate: toOptionalBoolean(willingToRelocate),
+                yearsExperience: toOptionalInt(yearsExperience),
+                prevEmployer: toNullableString(prevEmployer),
+                prevEmployerContact: toNullableString(prevEmployerContact),
+                workTypes: toStringArray(workTypes),
+                reasonForLeaving: toNullableString(reasonForLeaving),
+                highestEducation: toNullableString(highestEducation),
+                languages: toNullableString(languages),
+                specialSkills: toStringArray(specialSkills),
+                drivingLicense: toOptionalBoolean(drivingLicense),
+                availabilityType: toNullableString(availabilityType),
+                startDate: toOptionalDate(startDate),
+                preferredHours: toNullableString(preferredHours),
+                expectedSalary: toOptionalFloat(expectedSalary),
+                salaryNegotiable: toOptionalBoolean(salaryNegotiable),
+                emergencyName: toNullableString(emergencyName),
+                emergencyRelation: toNullableString(emergencyRelation),
+                emergencyPhone: toNullableString(emergencyPhone)
+            }
+        });
+
+        return res.status(201).json({
+            id: user.id,
+            email: user.email,
+            fullName: user.fullName,
+            phone: user.phone,
+            role: user.role,
+            createdAt: user.createdAt
+        });
+    } catch (error) {
+        console.error('Failed to create user:', error);
+        return res.status(500).json({ message: 'Failed to create user' });
+    }
+};
+
+export const updateAdminUser = async (req: AuthRequest, res: Response) => {
+    try {
+        const targetUserId = Number(req.params.id);
+        if (!Number.isFinite(targetUserId) || targetUserId <= 0) {
+            return res.status(400).json({ message: 'Invalid user id' });
+        }
+
+        const {
+            email, password, fullName, phone, role, address, description,
+            dob, gender, nidNumber, maritalStatus, childrenCount,
+            country, provinceDistrict, sectorCellVillage, willingToRelocate,
+            yearsExperience, prevEmployer, prevEmployerContact, workTypes,
+            reasonForLeaving, highestEducation, languages, specialSkills,
+            drivingLicense, availabilityType, startDate, preferredHours,
+            expectedSalary, salaryNegotiable, emergencyName, emergencyRelation, emergencyPhone
+        } = req.body || {};
+
+        const target = await prisma.user.findUnique({ where: { id: targetUserId } });
+        if (!target) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+
+        const roleValue = role !== undefined ? parseEnum(role, ROLE_VALUES) : null;
+        if (role !== undefined && !roleValue) {
+            return res.status(400).json({ message: `Invalid role. Allowed: ${ROLE_VALUES.join(', ')}` });
+        }
+
+        let normalizedEmail: string | undefined;
+        if (email !== undefined) {
+            normalizedEmail = String(email).trim().toLowerCase();
+            if (!normalizedEmail) {
+                return res.status(400).json({ message: 'Email cannot be empty' });
+            }
+            if (normalizedEmail !== target.email.toLowerCase()) {
+                const existing = await prisma.user.findFirst({
+                    where: { email: { equals: normalizedEmail, mode: 'insensitive' } }
+                });
+                if (existing) {
+                    return res.status(400).json({ message: 'Email already exists' });
+                }
+            }
+        }
+
+        let hashedPassword: string | undefined;
+        if (password !== undefined && String(password).trim()) {
+            const bcrypt = require('bcryptjs');
+            hashedPassword = await bcrypt.hash(String(password), 10);
+        }
+
+        const updated = await prisma.user.update({
+            where: { id: targetUserId },
+            data: {
+                email: normalizedEmail,
+                password: hashedPassword,
+                fullName: fullName !== undefined ? toNullableString(fullName) : undefined,
+                phone: phone !== undefined ? toNullableString(phone) : undefined,
+                address: address !== undefined ? toNullableString(address) : undefined,
+                description: description !== undefined ? toNullableString(description) : undefined,
+                role: roleValue || undefined,
+                dob: dob !== undefined ? toOptionalDate(dob) : undefined,
+                gender: gender !== undefined ? toNullableString(gender) : undefined,
+                nidNumber: nidNumber !== undefined ? toNullableString(nidNumber) : undefined,
+                maritalStatus: maritalStatus !== undefined ? toNullableString(maritalStatus) : undefined,
+                childrenCount: childrenCount !== undefined ? toOptionalInt(childrenCount) : undefined,
+                country: country !== undefined ? toNullableString(country) : undefined,
+                provinceDistrict: provinceDistrict !== undefined ? toNullableString(provinceDistrict) : undefined,
+                sectorCellVillage: sectorCellVillage !== undefined ? toNullableString(sectorCellVillage) : undefined,
+                willingToRelocate: willingToRelocate !== undefined ? toOptionalBoolean(willingToRelocate) : undefined,
+                yearsExperience: yearsExperience !== undefined ? toOptionalInt(yearsExperience) : undefined,
+                prevEmployer: prevEmployer !== undefined ? toNullableString(prevEmployer) : undefined,
+                prevEmployerContact: prevEmployerContact !== undefined ? toNullableString(prevEmployerContact) : undefined,
+                workTypes: workTypes !== undefined ? toStringArray(workTypes) : undefined,
+                reasonForLeaving: reasonForLeaving !== undefined ? toNullableString(reasonForLeaving) : undefined,
+                highestEducation: highestEducation !== undefined ? toNullableString(highestEducation) : undefined,
+                languages: languages !== undefined ? toNullableString(languages) : undefined,
+                specialSkills: specialSkills !== undefined ? toStringArray(specialSkills) : undefined,
+                drivingLicense: drivingLicense !== undefined ? toOptionalBoolean(drivingLicense) : undefined,
+                availabilityType: availabilityType !== undefined ? toNullableString(availabilityType) : undefined,
+                startDate: startDate !== undefined ? toOptionalDate(startDate) : undefined,
+                preferredHours: preferredHours !== undefined ? toNullableString(preferredHours) : undefined,
+                expectedSalary: expectedSalary !== undefined ? toOptionalFloat(expectedSalary) : undefined,
+                salaryNegotiable: salaryNegotiable !== undefined ? toOptionalBoolean(salaryNegotiable) : undefined,
+                emergencyName: emergencyName !== undefined ? toNullableString(emergencyName) : undefined,
+                emergencyRelation: emergencyRelation !== undefined ? toNullableString(emergencyRelation) : undefined,
+                emergencyPhone: emergencyPhone !== undefined ? toNullableString(emergencyPhone) : undefined
+            },
+            select: {
+                id: true,
+                email: true,
+                fullName: true,
+                phone: true,
+                address: true,
+                role: true,
+                createdAt: true,
+                updatedAt: true
+            }
+        });
+
+        return res.json(updated);
+    } catch (error) {
+        console.error('Failed to update user:', error);
+        return res.status(500).json({ message: 'Failed to update user' });
+    }
+};
+
+export const deleteAdminUser = async (req: AuthRequest, res: Response) => {
+    try {
+        const targetUserId = Number(req.params.id);
+        if (!Number.isFinite(targetUserId) || targetUserId <= 0) {
+            return res.status(400).json({ message: 'Invalid user id' });
+        }
+
+        const actingUserId = Number(req.user?.userId || 0);
+        if (actingUserId === targetUserId) {
+            return res.status(400).json({ message: 'You cannot delete your own admin account while logged in' });
+        }
+
+        const userExists = await prisma.user.findUnique({ where: { id: targetUserId }, select: { id: true } });
+        if (!userExists) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+
+        await prisma.$transaction(async (tx) => {
+            const [jobs, contracts, conversations] = await Promise.all([
+                tx.job.findMany({
+                    where: { employerId: targetUserId },
+                    select: { id: true }
+                }),
+                tx.contract.findMany({
+                    where: {
+                        OR: [{ employerId: targetUserId }, { maidId: targetUserId }]
+                    },
+                    select: { id: true }
+                }),
+                tx.conversation.findMany({
+                    where: { participants: { some: { id: targetUserId } } },
+                    select: { id: true }
+                })
+            ]);
+
+            const jobIds = jobs.map((job) => job.id);
+            const contractIds = contracts.map((contract) => contract.id);
+
+            if (jobIds.length > 0) {
+                await tx.application.deleteMany({
+                    where: { jobId: { in: jobIds } }
+                });
+            }
+
+            await tx.application.deleteMany({
+                where: { maidId: targetUserId }
+            });
+
+            if (contractIds.length > 0) {
+                await tx.review.deleteMany({
+                    where: { contractId: { in: contractIds } }
+                });
+                await tx.dispute.deleteMany({
+                    where: { contractId: { in: contractIds } }
+                });
+            }
+
+            await tx.review.deleteMany({
+                where: {
+                    OR: [{ reviewerId: targetUserId }, { revieweeId: targetUserId }]
+                }
+            });
+
+            await tx.dispute.deleteMany({
+                where: {
+                    OR: [{ complainantId: targetUserId }, { respondentId: targetUserId }]
+                }
+            });
+
+            await tx.unlockedProfile.deleteMany({
+                where: {
+                    OR: [{ employerId: targetUserId }, { maidId: targetUserId }]
+                }
+            });
+
+            await tx.payment.deleteMany({
+                where: { employerId: targetUserId }
+            });
+
+            await tx.notification.deleteMany({
+                where: { userId: targetUserId }
+            });
+
+            await tx.message.deleteMany({
+                where: { senderId: targetUserId }
+            });
+
+            for (const conversation of conversations) {
+                await tx.conversation.update({
+                    where: { id: conversation.id },
+                    data: {
+                        participants: {
+                            disconnect: { id: targetUserId }
+                        }
+                    }
+                });
+            }
+
+            if (contractIds.length > 0) {
+                await tx.contract.deleteMany({
+                    where: { id: { in: contractIds } }
+                });
+            }
+
+            if (jobIds.length > 0) {
+                await tx.job.deleteMany({
+                    where: { id: { in: jobIds } }
+                });
+            }
+
+            await tx.user.delete({ where: { id: targetUserId } });
+        });
+
+        return res.json({ message: 'User deleted successfully' });
+    } catch (error) {
+        console.error('Failed to delete user:', error);
+
+        if (error instanceof Prisma.PrismaClientKnownRequestError) {
+            if (error.code === 'P2003') {
+                return res.status(409).json({ message: 'User cannot be deleted due to existing related records' });
+            }
+            if (error.code === 'P2025') {
+                return res.status(404).json({ message: 'User not found' });
+            }
+        }
+
+        return res.status(500).json({ message: 'Failed to delete user' });
+    }
+};
+
+export const createAdminJob = async (req: AuthRequest, res: Response) => {
+    try {
+        const { title, description, location, salaryMin, salaryMax, employerId, requirements } = req.body;
+
+        if (!title || !location || !employerId) {
+            return res.status(400).json({ message: 'Title, location, and employerId are required' });
+        }
+
+        const job = await prisma.job.create({
+            data: {
+                title,
+                description: description || '',
+                requirements: requirements || null,
+                location,
+                salaryMin: salaryMin ? Number(salaryMin) : null,
+                salaryMax: salaryMax ? Number(salaryMax) : null,
+                employerId: Number(employerId),
+                status: JobStatus.OPEN
+            },
+            include: {
+                employer: { select: { id: true, fullName: true, email: true } }
+            }
+        });
+
+        return res.status(201).json(job);
+    } catch (error) {
+        console.error('Failed to create job:', error);
+        return res.status(500).json({ message: 'Failed to create job' });
+    }
+};
+
+export const deleteAdminJob = async (req: AuthRequest, res: Response) => {
+    try {
+        const jobId = Number(req.params.id);
+        if (!Number.isFinite(jobId) || jobId <= 0) {
+            return res.status(400).json({ message: 'Invalid job id' });
+        }
+
+        const jobExists = await prisma.job.findUnique({ where: { id: jobId }, select: { id: true } });
+        if (!jobExists) {
+            return res.status(404).json({ message: 'Job not found' });
+        }
+
+        await prisma.$transaction(async (tx) => {
+            await tx.application.deleteMany({ where: { jobId } });
+            await tx.job.delete({ where: { id: jobId } });
+        });
+
+        return res.json({ message: 'Job deleted successfully' });
+    } catch (error) {
+        console.error('Failed to delete job:', error);
+
+        if (error instanceof Prisma.PrismaClientKnownRequestError) {
+            if (error.code === 'P2003') {
+                return res.status(409).json({ message: 'Job cannot be deleted due to existing related records' });
+            }
+            if (error.code === 'P2025') {
+                return res.status(404).json({ message: 'Job not found' });
+            }
+        }
+
+        return res.status(500).json({ message: 'Failed to delete job' });
+    }
+};
+
+export const deleteAdminApplication = async (req: AuthRequest, res: Response) => {
+    try {
+        const applicationId = Number(req.params.id);
+        if (!Number.isFinite(applicationId) || applicationId <= 0) {
+            return res.status(400).json({ message: 'Invalid application id' });
+        }
+
+        const exists = await prisma.application.findUnique({ where: { id: applicationId }, select: { id: true } });
+        if (!exists) {
+            return res.status(404).json({ message: 'Application not found' });
+        }
+
+        await prisma.application.delete({ where: { id: applicationId } });
+
+        return res.json({ message: 'Application deleted successfully' });
+    } catch (error) {
+        console.error('Failed to delete application:', error);
+
+        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2025') {
+            return res.status(404).json({ message: 'Application not found' });
+        }
+
+        return res.status(500).json({ message: 'Failed to delete application' });
+    }
+};
+
+export const createAdminContract = async (req: AuthRequest, res: Response) => {
+    try {
+        const { title, description, employerId, maidId, salary, startDate, endDate, terms } = req.body;
+
+        if (!title || !employerId || !maidId || !salary || !startDate) {
+            return res.status(400).json({ message: 'Title, employerId, maidId, salary, and startDate are required' });
+        }
+
+        const contract = await prisma.contract.create({
+            data: {
+                title,
+                description: description || null,
+                employerId: Number(employerId),
+                maidId: Number(maidId),
+                salary: Number(salary),
+                startDate: new Date(startDate),
+                endDate: endDate ? new Date(endDate) : null,
+                terms: terms || null,
+                status: ContractStatus.DRAFT
+            },
+            include: {
+                employer: { select: { id: true, fullName: true, email: true } },
+                maid: { select: { id: true, fullName: true, email: true } }
+            }
+        });
+
+        return res.status(201).json(contract);
+    } catch (error) {
+        console.error('Failed to create contract:', error);
+        return res.status(500).json({ message: 'Failed to create contract' });
+    }
+};
+
+export const deleteAdminContract = async (req: AuthRequest, res: Response) => {
+    try {
+        const contractId = Number(req.params.id);
+        if (!Number.isFinite(contractId) || contractId <= 0) {
+            return res.status(400).json({ message: 'Invalid contract id' });
+        }
+
+        await prisma.contract.delete({ where: { id: contractId } });
+
+        return res.json({ message: 'Contract deleted successfully' });
+    } catch (error) {
+        console.error('Failed to delete contract:', error);
+        return res.status(500).json({ message: 'Failed to delete contract' });
+    }
+};
+
+export const deleteAdminPayment = async (req: AuthRequest, res: Response) => {
+    try {
+        const paymentId = Number(req.params.id);
+        if (!Number.isFinite(paymentId) || paymentId <= 0) {
+            return res.status(400).json({ message: 'Invalid payment id' });
+        }
+
+        const exists = await prisma.payment.findUnique({ where: { id: paymentId }, select: { id: true } });
+        if (!exists) {
+            return res.status(404).json({ message: 'Payment not found' });
+        }
+
+        await prisma.payment.delete({ where: { id: paymentId } });
+
+        return res.json({ message: 'Payment deleted successfully' });
+    } catch (error) {
+        console.error('Failed to delete payment:', error);
+
+        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2025') {
+            return res.status(404).json({ message: 'Payment not found' });
+        }
+
+        return res.status(500).json({ message: 'Failed to delete payment' });
+    }
+};
+
+export const deleteAdminDispute = async (req: AuthRequest, res: Response) => {
+    try {
+        const disputeId = Number(req.params.id);
+        if (!Number.isFinite(disputeId) || disputeId <= 0) {
+            return res.status(400).json({ message: 'Invalid dispute id' });
+        }
+
+        await prisma.dispute.delete({ where: { id: disputeId } });
+
+        return res.json({ message: 'Dispute deleted successfully' });
+    } catch (error) {
+        console.error('Failed to delete dispute:', error);
+        return res.status(500).json({ message: 'Failed to delete dispute' });
+    }
+};
+
+export const deleteAdminReview = async (req: AuthRequest, res: Response) => {
+    try {
+        const reviewId = Number(req.params.id);
+        if (!Number.isFinite(reviewId) || reviewId <= 0) {
+            return res.status(400).json({ message: 'Invalid review id' });
+        }
+
+        await prisma.review.delete({ where: { id: reviewId } });
+
+        return res.json({ message: 'Review deleted successfully' });
+    } catch (error) {
+        console.error('Failed to delete review:', error);
+        return res.status(500).json({ message: 'Failed to delete review' });
     }
 };
